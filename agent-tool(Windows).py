@@ -1,4 +1,4 @@
-# !/usr/bin/env python3
+#!/usr/bin/env python3
 import subprocess
 import sys
 import os
@@ -7,19 +7,20 @@ import json
 import argparse
 import logging
 import time
-import signal
 import datetime
+import signal
 import base64
+from collections import deque
 
 
 class WinDumpMonitor:
     def __init__(self, ports, interface=None, source_ip=None, source_ports=None):
         """初始化監聽器"""
-        self.ports = [int(port) for port in ports.split(',')] if isinstance(ports, str) else [ports]
-        self.setup_logging()
+        self.ports = [int(port) for port in ports.split(',')] if isinstance(ports, str) else [ports]  # str 轉 int
+        self.setup_logging()  # 啟動log 紀錄
 
-        # Windows下的網路介面通常使用不同的命名方式，可能是數字或GUID
-        self.interface = interface if interface != "any" else None
+        # Windows 網卡介面通常是數字格式
+        self.interface = interface
         self.source_ip = source_ip
 
         # 處理源端口
@@ -31,41 +32,48 @@ class WinDumpMonitor:
         else:
             self.source_ports = []
 
-        # 建立數據目錄
-        self.json_dir = "json_packets"
-        self.pcap_dir = "captures"
+        # 建立資料儲存目錄 (Windows路徑格式)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        self.json_dir = os.path.join(current_dir, "json_packets")
+        self.pcap_dir = os.path.join(current_dir, "captures")
         os.makedirs(self.json_dir, exist_ok=True)
         os.makedirs(self.pcap_dir, exist_ok=True)
 
-        # 顯示配置信息
-        self.logger.info(f"監控端口: {self.ports}")
+        # 顯示設定訊息
+        self.logger.info(f"Monitoring ports: {self.ports}")
         if self.source_ip:
-            self.logger.info(f"過濾來源IP: {self.source_ip}")
+            self.logger.info(f"Filtering by source IP: {self.source_ip}")
         if self.source_ports:
-            self.logger.info(f"過濾來源端口: {self.source_ports}")
-        self.logger.info(f"JSON封包將保存在: {os.path.abspath(self.json_dir)}")
-        self.logger.info(f"PCAP檔案將保存在: {os.path.abspath(self.pcap_dir)}")
+            self.logger.info(f"Filtering by source ports: {self.source_ports}")
+        self.logger.info(f"JSON packets will be saved in: {os.path.abspath(self.json_dir)}")
+        self.logger.info(f"PCAP files will be saved in: {os.path.abspath(self.pcap_dir)}")
 
         # 處理進程
         self.windump_process = None
 
+        # FPS 計算相關
+        self.packet_times = deque(maxlen=100)  # 儲存最近100個封包的時間戳
+        self.last_fps_update = time.time()
+        self.fps = 0
+        self.fps_update_interval = 1.0  # 每1秒更新一次FPS
+
     def setup_logging(self):
         """設置日誌記錄"""
+        log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'packet_monitor.log')
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler('packet_monitor.log'),
+                logging.FileHandler(log_file),
                 logging.StreamHandler()
             ]
         )
         self.logger = logging.getLogger(__name__)
 
     def parse_windump_line(self, line):
-        """解析windump輸出行"""
+        """解析WinDump輸出行"""
         try:
-            # Windows環境下可能會有不同的輸出格式
-            # 移除ANSI顏色代碼
+            # 移除 ANSI 控制碼
             ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
             line = ansi_escape.sub('', line)
 
@@ -82,7 +90,7 @@ class WinDumpMonitor:
                 "dest_port": 0
             }
 
-            # 嘗試提取完整時間戳 (當windump啟用了 -tttt 參數時)
+            # 嘗試提取完整時間戳 (當WinDump啟用了 -tttt 參數時)
             timestamp_pattern = re.compile(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)')
             timestamp_match = timestamp_pattern.search(line)
             if timestamp_match:
@@ -204,8 +212,8 @@ class WinDumpMonitor:
 
             return packet_info
         except Exception as e:
-            self.logger.error(f"解析windump行錯誤: {str(e)}")
-            self.logger.error(f"有問題的行: {line}")
+            self.logger.error(f"Error parsing WinDump line: {str(e)}")
+            self.logger.error(f"Problematic line: {line}")
             import traceback
             self.logger.error(traceback.format_exc())
             return {"raw_output": line.strip(),
@@ -214,35 +222,72 @@ class WinDumpMonitor:
                     "dest_ip": "parse_error",
                     "dest_port": 0}
 
+    def should_save_packet(self, packet_info):
+        """檢查封包是否符合過濾條件，只保留匹配的IP和端口"""
+        # 檢查是否符合源IP過濾條件（如果有指定）
+        if self.source_ip and packet_info['source_ip'] != self.source_ip:
+            return False
+
+        # 檢查是否符合源端口過濾條件（如果有指定）
+        if self.source_ports and packet_info['source_port'] not in self.source_ports:
+            return False
+
+        # 檢查是否符合目標端口過濾條件
+        if packet_info['dest_port'] not in self.ports:
+            return False
+
+        # 如果以上條件都通過，則該封包符合保存條件
+        return True
+
     def save_packet_json(self, packet_info):
         """將封包信息保存為JSON文件"""
         try:
             # 生成文件名
-            timestamp = packet_info.get('timestamp', datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f"))
+            timestamp = packet_info.get('packet_timestamp', datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f"))
             timestamp = timestamp.replace(':', '-').replace(' ', '_')
-            filename = f"{self.json_dir}/packet_{timestamp}.json"
+            filename = os.path.join(self.json_dir, f"packet_{timestamp}.json")
 
             # 寫入文件
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(packet_info, f, ensure_ascii=False, indent=2)
 
         except Exception as e:
-            self.logger.error(f"保存JSON文件錯誤: {str(e)}")
+            self.logger.error(f"Error saving JSON file: {str(e)}")
+
+    def update_fps(self):
+        """計算並更新FPS值"""
+        now = time.time()
+
+        # 添加當前時間戳到隊列
+        self.packet_times.append(now)
+
+        # 檢查是否應該計算並顯示FPS
+        if now - self.last_fps_update >= self.fps_update_interval:
+            # 如果隊列中有足夠的包，計算FPS
+            if len(self.packet_times) > 1:
+                time_span = self.packet_times[-1] - self.packet_times[0]
+                if time_span > 0:
+                    self.fps = (len(self.packet_times) - 1) / time_span
+                    self.logger.info(f"Current Stream FPS: {self.fps:.2f}")
+
+            self.last_fps_update = now
+
+        return self.fps
 
     def start_monitoring(self):
         """開始監聽封包"""
         try:
-            # 建立windump命令
-            # Windows環境下不需要使用sudo
-            cmd = ["windump"]
+            # Windows需要指定WinDump完整路徑，假設WinDump.exe在當前目錄或PATH中
+            windump_path = "WinDump.exe"
+
+            # 建立WinDump命令
+            cmd = [windump_path]
 
             # 添加介面選項
             if self.interface:
                 cmd.extend(["-i", self.interface])
             else:
-                # 查找可用網路介面的命令提示
-                self.logger.info("若未指定介面，建議先執行 'windump -D' 查看可用的網路介面列表")
-                cmd.extend(["-i", "1"])  # Windows預設使用第一個介面
+                cmd.extend(["-i", "1"])  # Windows默認使用介面1，請根據實際情況修改
 
             # 設置過濾器
             filter_parts = []
@@ -269,128 +314,181 @@ class WinDumpMonitor:
             # 添加過濾表達式
             cmd.append(filter_expr)
 
-            # Windows中的信號處理可能有所不同
-            # 設置終止時的清理處理
-            def signal_handler(sig, frame):
-                self.logger.info("\n停止封包捕獲...")
+            # Windows處理Ctrl+C方式不同，嘗試設置處理器
+            def windows_signal_handler(sig, frame):
+                self.logger.info("\nStopping packet capture...")
                 if self.windump_process:
-                    # Windows使用不同的終止進程方法
-                    self.windump_process.terminate()
+                    try:
+                        # Windows上更可靠的終止進程方式
+                        import ctypes
+                        kernel32 = ctypes.WinDLL('kernel32')
+                        handle = kernel32.OpenProcess(1, 0, self.windump_process.pid)
+                        kernel32.TerminateProcess(handle, 0)
+                        kernel32.CloseHandle(handle)
+                    except:
+                        self.windump_process.terminate()
                 sys.exit(0)
 
-            # 設置信號處理器，對於CTRL+C事件
-            signal.signal(signal.SIGINT, signal_handler)
+            # 在Windows上設置信號處理
+            try:
+                signal.signal(signal.SIGINT, windows_signal_handler)
+                signal.signal(signal.SIGTERM, windows_signal_handler)
+            except (AttributeError, ValueError):
+                self.logger.warning("Could not set up signal handlers properly on Windows.")
 
             # 顯示最終命令
             cmd_str = " ".join(cmd)
-            self.logger.info(f"使用命令啟動windump: {cmd_str}")
-            self.logger.info("封包捕獲已開始 (按Ctrl+C停止)...")
+            self.logger.info(f"Starting WinDump with command: {cmd_str}")
+            self.logger.info("Packet capture started (press Ctrl+C to stop)...")
 
-            # 啟動windump進程
-            # Windows環境中可能需要管理員權限運行
-            self.windump_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                bufsize=1,  # 行緩衝
-                creationflags=subprocess.CREATE_NO_WINDOW  # Windows特有，避免出現命令提示視窗
-            )
+            # 啟動WinDump進程
+            # 注意：Windows可能需要管理員權限來運行WinDump
+            try:
+                self.windump_process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    bufsize=1,  # 行緩衝
+                    creationflags=subprocess.CREATE_NO_WINDOW  # Windows特有，不顯示命令窗口
+                )
+            except AttributeError:
+                # 如果CREATE_NO_WINDOW不可用，嘗試普通方式啟動
+                self.windump_process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    bufsize=1  # 行緩衝
+                )
 
-            # 先嘗試讀取一次stderr，確認windump開始運行
-            stderr_line = self.windump_process.stderr.readline()
-            if stderr_line:
-                self.logger.info(f"windump: {stderr_line.strip()}")
+            # 先嘗試讀取一次stderr，確認WinDump開始運行
+            try:
+                stderr_line = self.windump_process.stderr.readline()
+                if stderr_line:
+                    self.logger.info(f"WinDump: {stderr_line.strip()}")
+            except Exception as e:
+                self.logger.warning(f"Could not read stderr: {str(e)}")
 
             # 開始讀取stdout，捕獲封包
             packet_count = 0
+            saved_count = 0
+
             while True:
-                line = self.windump_process.stdout.readline()
-                if not line:
+                try:
+                    line = self.windump_process.stdout.readline()
+                    if not line:
+                        break
+
+                    # 處理封包數據
+                    packet_info = self.parse_windump_line(line)
+                    if packet_info:
+                        packet_count += 1
+
+                        # 檢查是否符合保存條件
+                        if self.should_save_packet(packet_info):
+                            # 更新FPS計算
+                            current_fps = self.update_fps()
+                            packet_info["fps"] = current_fps
+
+                            # 保存符合條件的封包
+                            self.save_packet_json(packet_info)
+                            saved_count += 1
+
+                            # 顯示封包信息
+                            src = f"{packet_info['source_ip']}:{packet_info['source_port']}"
+                            dst = f"{packet_info['dest_ip']}:{packet_info['dest_port']}"
+                            proto = packet_info.get('protocol', 'unknown')
+                            pkt_time = packet_info.get('packet_timestamp', 'unknown')
+
+                            self.logger.info(f"Saved Packet: [{pkt_time}] {src} -> {dst} ({proto})")
+
+                        # 每10個封包顯示一次統計
+                        if packet_count % 10 == 0:
+                            self.logger.info(f"Total packets captured: {packet_count}, Saved: {saved_count}")
+                except KeyboardInterrupt:
+                    # 在Windows上特別處理Ctrl+C
+                    self.logger.info("\nStopping packet capture (keyboard interrupt)...")
                     break
-
-                # 處理並保存封包數據
-                packet_info = self.parse_windump_line(line)
-                if packet_info:
-                    self.save_packet_json(packet_info)
-
-                    # 顯示封包信息
-                    src = f"{packet_info['source_ip']}:{packet_info['source_port']}"
-                    dst = f"{packet_info['dest_ip']}:{packet_info['dest_port']}"
-                    proto = packet_info.get('protocol', 'unknown')
-                    pkt_time = packet_info.get('packet_timestamp', 'unknown')
-
-                    self.logger.info(f"封包: [{pkt_time}] {src} -> {dst} ({proto})")
-                    packet_count += 1
-
-                    # 每封包顯示一次統計
-                    self.logger.info(f"已捕獲封包總數: {packet_count}")
+                except Exception as e:
+                    self.logger.error(f"Error processing packet: {str(e)}")
+                    import traceback
+                    self.logger.error(traceback.format_exc())
+                    # 繼續捕獲，不中斷
 
             # 如果沒有正確退出循環，嘗試讀取錯誤輸出
-            stderr_output = self.windump_process.stderr.read()
-            if stderr_output:
-                self.logger.error(f"windump錯誤: {stderr_output}")
+            try:
+                stderr_output = self.windump_process.stderr.read()
+                if stderr_output:
+                    self.logger.error(f"WinDump error: {stderr_output}")
+            except:
+                pass
 
             # 進程結束
-            self.windump_process.wait()
-            self.logger.info(f"windump進程已結束，共捕獲 {packet_count} 個封包")
+            try:
+                self.windump_process.terminate()
+                self.windump_process.wait(timeout=5)
+            except:
+                pass
+
+            self.logger.info(f"WinDump process ended, captured {packet_count} packets, saved {saved_count} packets")
 
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"執行windump時發生錯誤: {e.output}")
+            self.logger.error(f"Error running WinDump: {e.output}")
             sys.exit(1)
         except FileNotFoundError:
-            self.logger.error("找不到windump命令。請確保安裝了WinDump並設置在PATH環境變數中。")
-            self.logger.info("您可以從以下位置下載WinDump: https://www.winpcap.org/windump/")
-            self.logger.info("同時請安裝WinPcap: https://www.winpcap.org/")
+            self.logger.error(
+                "WinDump.exe not found. Please ensure WinDump is installed and in the PATH or current directory.")
             sys.exit(1)
         except Exception as e:
-            self.logger.error(f"監控時發生錯誤: {str(e)}")
+            self.logger.error(f"Error in monitoring: {str(e)}")
             import traceback
             self.logger.error(traceback.format_exc())
             sys.exit(1)
 
 
 def list_interfaces():
-    """顯示可用的網路介面"""
+    """列出所有可用的網絡介面"""
     try:
-        interfaces_process = subprocess.Popen(
-            ["windump", "-D"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
-        )
-        stdout, stderr = interfaces_process.communicate()
-
-        if stderr and not stdout:
-            print(f"錯誤: {stderr}")
-            return
-
-        print("可用的網路介面:")
-        print(stdout)
+        # 執行WinDump -D來列出所有介面
+        result = subprocess.run(["WinDump.exe", "-D"], capture_output=True, text=True)
+        if result.returncode == 0:
+            print("Available network interfaces:")
+            print(result.stdout)
+        else:
+            print("Error listing interfaces:")
+            print(result.stderr)
     except FileNotFoundError:
-        print("找不到windump命令。請確保安裝了WinDump並設置在PATH環境變數中。")
-        print("您可以從以下位置下載WinDump: https://www.winpcap.org/windump/")
-        print("同時請安裝WinPcap: https://www.winpcap.org/")
+        print("WinDump.exe not found. Please ensure WinDump is installed and in the PATH or current directory.")
+    except Exception as e:
+        print(f"Error listing interfaces: {str(e)}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Windows網路封包監控工具 (基於WinDump)')
+    parser = argparse.ArgumentParser(description='Network Packet Monitoring Tool (WinDump-based)')
     parser.add_argument('-p', '--ports', type=str, required=True,
-                        help='要監控的端口 (以逗號分隔，例如 8080,443,3306)')
+                        help='Ports to monitor (comma-separated, e.g., 8080,443,3306)')
     parser.add_argument('-i', '--interface', type=str, default=None,
-                        help='要監控的網路介面 (預設: 1，使用第一個介面)')
+                        help='Network interface to monitor (default: 1)')
     parser.add_argument('-s', '--source', type=str, default=None,
-                        help='要過濾的源IP (僅捕獲來自此IP的封包)')
+                        help='Source IP to filter (only capture packets from this IP)')
     parser.add_argument('-sp', '--source-ports', type=str, default=None,
-                        help='要過濾的源端口 (以逗號分隔，例如 12345,54321)')
+                        help='Source ports to filter (comma-separated, e.g., 12345,54321)')
     parser.add_argument('-l', '--list-interfaces', action='store_true',
-                        help='列出所有可用的網路介面')
+                        help='List available network interfaces and exit')
 
     args = parser.parse_args()
 
+    # 如果要列出介面，則列出後退出
     if args.list_interfaces:
         list_interfaces()
         return
+
+    # 如果未指定介面，使用默認值1
+    if args.interface is None:
+        args.interface = "1"
+        print("No interface specified, using default interface 1.")
+        print("Use -l to list available interfaces or -i to specify an interface.")
 
     monitor = WinDumpMonitor(args.ports, args.interface, args.source, args.source_ports)
     monitor.start_monitoring()
